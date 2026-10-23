@@ -218,7 +218,7 @@ class TrayIcon:
         self.icon_path = icon_path
         self.tooltip = tooltip
         self._on_action = on_action
-        self.state = {"float": False, "autostart": False}
+        self.state = {"float": False, "autostart": False, "click": "open"}
         self._hwnd = None
         self._nid = None
         self._icon = None
@@ -244,6 +244,10 @@ class TrayIcon:
     def set_state(self, float_visible: bool, autostart: bool):
         self.state["float"] = float_visible
         self.state["autostart"] = autostart
+
+    def set_click_action(self, action: str):
+        """左键单击行为：open 打开主界面 / toggle_float 切换悬浮窗。"""
+        self.state["click"] = "toggle_float" if action == "toggle_float" else "open"
 
     def notify(self, title: str, text: str):
         with self._lock:
@@ -313,7 +317,7 @@ class TrayIcon:
             elif event == WM_LBUTTONDBLCLK:
                 self._on_action("open")
             elif event == WM_LBUTTONUP:
-                self._on_action("toggle_float")
+                self._on_action(self.state["click"])
             return 0
         if msg == WM_CLOSE:
             user32.DestroyWindow(hwnd)
@@ -332,13 +336,14 @@ class TrayIcon:
             return
         user32.AppendMenuW(menu, MF_STRING, 1, "打开主界面")
         user32.AppendMenuW(menu, MF_STRING, 2, "显示悬浮窗")
+        user32.AppendMenuW(menu, MF_STRING, 3, "设置...")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, 3, "开机自动启动")
+        user32.AppendMenuW(menu, MF_STRING, 4, "开机自动启动")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, 4, "退出")
+        user32.AppendMenuW(menu, MF_STRING, 5, "退出")
 
         user32.CheckMenuItem(menu, 2, MF_BYCOMMAND | (MF_CHECKED if self.state["float"] else MF_UNCHECKED))
-        user32.CheckMenuItem(menu, 3, MF_BYCOMMAND | (MF_CHECKED if self.state["autostart"] else MF_UNCHECKED))
+        user32.CheckMenuItem(menu, 4, MF_BYCOMMAND | (MF_CHECKED if self.state["autostart"] else MF_UNCHECKED))
 
         position = wt.POINT()
         user32.GetCursorPos(ctypes.byref(position))
@@ -355,7 +360,9 @@ class TrayIcon:
             self.state["float"] = not self.state["float"]
             self._on_action("toggle_float")
         elif command == 3:
+            self._on_action("settings")
+        elif command == 4:
             self.state["autostart"] = not self.state["autostart"]
             self._on_action("toggle_autostart")
-        elif command == 4:
+        elif command == 5:
             self._on_action("quit")

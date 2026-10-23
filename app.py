@@ -76,6 +76,36 @@ def save_settings(settings: dict) -> None:
         pass
 
 
+FLOAT_METRICS = (("cpu", "CPU 使用率"), ("gpu", "GPU 使用率"),
+                 ("mem", "内存占用"), ("net", "网络速度"),
+                 ("chart", "CPU 走势曲线"))
+
+
+def load_float_options(settings: dict) -> dict:
+    raw = settings.get("float_metrics")
+    raw = raw if isinstance(raw, dict) else {}
+    metrics = {key: bool(raw.get(key, True)) for key, _ in FLOAT_METRICS}
+    try:
+        opacity = int(settings.get("float_opacity", 100))
+    except (TypeError, ValueError):
+        opacity = 100
+    return {"metrics": metrics,
+            "opacity": max(10, min(100, opacity)),
+            "clock": bool(settings.get("float_clock", True)),
+            "topmost": bool(settings.get("float_topmost", True))}
+
+
+def store_float_options(settings: dict, options: dict) -> None:
+    settings["float_metrics"] = dict(options["metrics"])
+    settings["float_opacity"] = int(options["opacity"])
+    settings["float_clock"] = bool(options["clock"])
+    settings["float_topmost"] = bool(options["topmost"])
+
+
+def normalize_tray_click(value) -> str:
+    return value if value in ("open", "toggle_float") else "open"
+
+
 # --------------------------------------------------------------------------
 # 工具函数
 # --------------------------------------------------------------------------
@@ -126,6 +156,18 @@ def nice_max(value: float) -> float:
         if value <= mult * base:
             return mult * base
     return 10 * base
+
+
+def apply_dark_titlebar(window) -> None:
+    """让标题栏跟随深色主题（Win10 2004+ / Win11，失败则忽略）。"""
+    try:
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        enabled = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -629,60 +671,205 @@ class MiniChart(tk.Canvas):
         self.create_line(*points, fill=self._color, width=1.5)
 
 
+class Slider(tk.Canvas):
+    """轻量滑杆：拖动实时回调，松开时触发保存。"""
+
+    PAD = 10
+
+    def __init__(self, master, from_: float, to: float, value: float,
+                 command, on_release=None, bg: str = PANEL):
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0,
+                         height=22, cursor="hand2")
+        self._min, self._max = float(from_), float(to)
+        self._value = float(value)
+        self._command = command
+        self._on_release = on_release
+        self._dragging = False
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release_event)
+
+    def set(self, value, notify: bool = False):
+        self._value = max(self._min, min(self._max, float(value)))
+        self._draw()
+        if notify and self._command:
+            self._command(self._value)
+
+    def get(self) -> int:
+        return int(round(self._value))
+
+    def _draw(self):
+        self.delete("all")
+        width, height = self.winfo_width(), self.winfo_height()
+        if width < 24:
+            return
+        x1, x2 = self.PAD, width - self.PAD
+        mid = height / 2
+        ratio = (self._value - self._min) / max(self._max - self._min, 1e-9)
+        pos = x1 + (x2 - x1) * ratio
+        self.create_line(x1, mid, x2, mid, fill=PANEL_ALT, width=4,
+                         capstyle="round")
+        if pos > x1:
+            self.create_line(x1, mid, pos, mid, fill=C_CPU, width=4,
+                             capstyle="round")
+        r = 6
+        self.create_oval(pos - r, mid - r, pos + r, mid + r,
+                         fill=C_CPU, outline="")
+
+    def _value_at(self, x: float) -> float:
+        x1, x2 = self.PAD, self.winfo_width() - self.PAD
+        ratio = (x - x1) / max(x2 - x1, 1)
+        return self._min + (self._max - self._min) * max(0.0, min(1.0, ratio))
+
+    def _update(self, x: float):
+        value = round(self._value_at(x))
+        if value != self._value:
+            self._value = value
+            self._draw()
+            if self._command:
+                self._command(value)
+
+    def _on_press(self, event):
+        self._dragging = True
+        self._update(event.x)
+
+    def _on_drag(self, event):
+        if self._dragging:
+            self._update(event.x)
+
+    def _on_release_event(self, _event):
+        self._dragging = False
+        if self._on_release:
+            self._on_release()
+
+
 class FloatingMonitor(tk.Toplevel):
     """桌面悬浮迷你监控条：可拖动、置顶、双击打开主界面。"""
 
     def __init__(self, app: "MonitorApp"):
         super().__init__(app)
         self.app = app
+        self.options = dict(app.float_options)
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
         self.configure(bg=PANEL)
         self.withdraw()
         self._visible = False
         self._drag_offset = None
-        self._build()
 
         x = app.settings.get("float_x")
         y = app.settings.get("float_y")
         if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
             x = self.winfo_screenwidth() - FLOAT_W - 28
             y = 64
-        x = max(0, min(int(x), self.winfo_screenwidth() - FLOAT_W))
-        y = max(0, min(int(y), self.winfo_screenheight() - FLOAT_H))
-        self.geometry(f"{FLOAT_W}x{FLOAT_H}+{x}+{y}")
+        self._x, self._y = int(x), int(y)
+        self._height = FLOAT_H
+        self._build()
+        self._apply_geometry()
         self._apply_native_corners()
 
+    def _compute_height(self, metrics: dict) -> int:
+        height = 42
+        for key in ("cpu", "gpu", "mem"):
+            if metrics.get(key):
+                height += 26
+        if metrics.get("net"):
+            height += 26
+        if metrics.get("chart"):
+            height += 30
+        if not any(metrics.get(key) for key, _ in FLOAT_METRICS):
+            height += 26
+        return height + 10
+
+    def _apply_geometry(self):
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        self._x = max(0, min(self._x, screen_w - FLOAT_W))
+        self._y = max(0, min(self._y, screen_h - self._height))
+        self.geometry(f"{FLOAT_W}x{self._height}+{self._x}+{self._y}")
+
+    def _apply_window_attributes(self):
+        try:
+            self.attributes("-alpha", max(0.1, min(1.0, self.options["opacity"] / 100)))
+            self.attributes("-topmost", bool(self.options["topmost"]))
+        except tk.TclError:
+            pass
+
+    def apply_options(self, options: dict):
+        """应用新的显示配置：重建布局并调整窗口高度。"""
+        self.options = dict(options)
+        self._build()
+        self._apply_geometry()
+        self._apply_window_attributes()
+        if self._visible:
+            self.deiconify()
+            self.lift()
+        self._apply_native_corners()
+
+    def set_opacity(self, value: int):
+        self.options["opacity"] = max(10, min(100, int(value)))
+        try:
+            self.attributes("-alpha", self.options["opacity"] / 100)
+        except tk.TclError:
+            pass
+
     def _apply_native_corners(self):
-        """用 Win11 原生圆角：与主界面同半径，系统抗锯齿，没有毛边。"""
+        """Win11 用系统原生圆角；旧系统退回圆形窗口区域。"""
         try:
             self.update_idletasks()
             hwnd = int(self.wm_frame(), 16)
         except (tk.TclError, ValueError):
             return
+        applied = False
         try:
             dwm = ctypes.windll.dwmapi
+            dwm.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                  ctypes.c_void_p, ctypes.c_uint]
+            dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            hr = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 33,
+                                           ctypes.byref(pref), ctypes.sizeof(pref))
+            applied = hr == 0
+            if applied:
+                border = ctypes.c_uint(0x0034261C)  # COLORREF：#1c2634
+                dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34,
+                                          ctypes.byref(border),
+                                          ctypes.sizeof(border))
         except (AttributeError, OSError):
-            return
-        dwm.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                              ctypes.c_void_p, ctypes.c_uint]
-        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
-        pref = ctypes.c_int(2)  # DWMWCP_ROUND
-        dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 33,
-                                  ctypes.byref(pref), ctypes.sizeof(pref))
-        border = ctypes.c_uint(0x0034261C)  # COLORREF：#1c2634
-        dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34,
-                                  ctypes.byref(border), ctypes.sizeof(border))
+            applied = False
+        if not applied:
+            self._apply_round_region(hwnd)
+
+    def _apply_round_region(self, hwnd: int):
+        """Win10 及更早系统：用窗口区域裁出圆角。"""
+        try:
+            gdi = ctypes.windll.gdi32
+            gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+            user32 = ctypes.windll.user32
+            user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_bool]
+            user32.SetWindowRgn.restype = ctypes.c_int
+            rgn = gdi.CreateRoundRectRgn(0, 0, FLOAT_W + 1, self._height + 1,
+                                         16, 16)
+            if rgn:
+                user32.SetWindowRgn(ctypes.c_void_p(hwnd),
+                                    ctypes.c_void_p(rgn), True)
+        except (AttributeError, OSError):
+            pass
 
     @property
     def visible(self) -> bool:
         return self._visible
 
     def _build(self):
-        background = tk.Canvas(self, width=FLOAT_W, height=FLOAT_H,
+        for child in self.winfo_children():
+            child.destroy()
+        metrics = self.options["metrics"]
+        self._height = self._compute_height(metrics)
+
+        background = tk.Canvas(self, width=FLOAT_W, height=self._height,
                                bg=PANEL, highlightthickness=0, bd=0)
         background.place(x=0, y=0)
-        background.create_line(14, 148, FLOAT_W - 14, 148, fill=BORDER)
         self._bind_motion(background)
 
         dot = tk.Label(self, text="●", bg=PANEL, fg=C_CPU, font=(NUM, 7))
@@ -690,19 +877,30 @@ class FloatingMonitor(tk.Toplevel):
         title = tk.Label(self, text="系统监控", bg=PANEL, fg=TEXT,
                          font=(FONT, 9, "bold"))
         title.place(x=26, y=10)
-        self.clock = tk.Label(self, text="", bg=PANEL, fg=DIM, font=(NUM, 8))
-        self.clock.place(x=FLOAT_W - 108, y=12, width=46)
+        for widget in (dot, title):
+            self._bind_motion(widget)
+
+        self.clock = None
+        if self.options["clock"]:
+            self.clock = tk.Label(self, text="", bg=PANEL, fg=DIM,
+                                  font=(NUM, 8))
+            self.clock.place(x=FLOAT_W - 108, y=12, width=46)
+
         close = tk.Label(self, text="×", bg=PANEL, fg=MUTED, font=(NUM, 12),
                          cursor="hand2")
         close.place(x=FLOAT_W - 27, y=5)
         close.bind("<Button-1>", self._on_close_click)
-        for widget in (dot, title):
-            self._bind_motion(widget)
 
         self.rows = {}
+        self.net_down = None
+        self.net_up = None
+        self.spark = None
+
         y = 42
         for key, label, color in (("cpu", "CPU", C_CPU), ("gpu", "GPU", C_GPU),
                                   ("mem", "内存", C_MEM)):
+            if not metrics.get(key):
+                continue
             name = tk.Label(self, text=label, bg=PANEL, fg=MUTED,
                             font=(FONT, 8), anchor="w")
             name.place(x=14, y=y, width=40)
@@ -716,18 +914,28 @@ class FloatingMonitor(tk.Toplevel):
             self._bind_motion(value)
             y += 26
 
-        self.net_down = tk.Label(self, text="↓ --", bg=PANEL, fg=C_NET_D,
-                                 font=(NUM, 8, "bold"), anchor="w")
-        self.net_down.place(x=14, y=121, width=136)
-        self.net_up = tk.Label(self, text="↑ --", bg=PANEL, fg=C_NET_U,
-                               font=(NUM, 8, "bold"), anchor="w")
-        self.net_up.place(x=154, y=121, width=132)
-        for widget in (self.net_down, self.net_up):
-            self._bind_motion(widget)
+        if metrics.get("net"):
+            self.net_down = tk.Label(self, text="↓ --", bg=PANEL, fg=C_NET_D,
+                                     font=(NUM, 8, "bold"), anchor="w")
+            self.net_down.place(x=14, y=y + 2, width=136)
+            self.net_up = tk.Label(self, text="↑ --", bg=PANEL, fg=C_NET_U,
+                                   font=(NUM, 8, "bold"), anchor="w")
+            self.net_up.place(x=154, y=y + 2, width=132)
+            for widget in (self.net_down, self.net_up):
+                self._bind_motion(widget)
+            y += 26
 
-        self.spark = MiniChart(self, C_CPU, bg=PANEL)
-        self.spark.place(x=14, y=152, width=FLOAT_W - 28, height=24)
-        self._bind_motion(self.spark)
+        if metrics.get("chart"):
+            background.create_line(14, y + 3, FLOAT_W - 14, y + 3, fill=BORDER)
+            self.spark = MiniChart(self, C_CPU, bg=PANEL)
+            self.spark.place(x=14, y=y + 7, width=FLOAT_W - 28, height=24)
+            self._bind_motion(self.spark)
+
+        if not any(metrics.get(key) for key, _ in FLOAT_METRICS):
+            hint = tk.Label(self, text="未选择显示项，请在设置中勾选",
+                            bg=PANEL, fg=DIM, font=(FONT, 8))
+            hint.place(x=14, y=48, width=FLOAT_W - 28)
+            self._bind_motion(hint)
 
     def _bind_motion(self, widget):
         widget.bind("<ButtonPress-1>", self._drag_start)
@@ -745,13 +953,15 @@ class FloatingMonitor(tk.Toplevel):
         x = event.x_root - self._drag_offset[0]
         y = event.y_root - self._drag_offset[1]
         x = max(0, min(x, self.winfo_screenwidth() - FLOAT_W))
-        y = max(0, min(y, self.winfo_screenheight() - FLOAT_H))
+        y = max(0, min(y, self.winfo_screenheight() - self._height))
+        self._x, self._y = x, y
         self.geometry(f"+{x}+{y}")
 
     def _drag_end(self, _event):
         self._drag_offset = None
-        self.app.settings["float_x"] = self.winfo_x()
-        self.app.settings["float_y"] = self.winfo_y()
+        self._x, self._y = self.winfo_x(), self.winfo_y()
+        self.app.settings["float_x"] = self._x
+        self.app.settings["float_y"] = self._y
         self.app.save_settings()
 
     def _on_close_click(self, _event):
@@ -759,8 +969,8 @@ class FloatingMonitor(tk.Toplevel):
         return "break"
 
     def show(self):
+        self._apply_window_attributes()
         self.deiconify()
-        self.attributes("-topmost", True)
         self.lift()
         self._visible = True
 
@@ -776,19 +986,192 @@ class FloatingMonitor(tk.Toplevel):
         values = {"cpu": data["cpu"]["total"], "gpu": gpu_util,
                   "mem": data["mem"]["percent"]}
         for key, value in values.items():
-            label, bar = self.rows[key]
+            row = self.rows.get(key)
+            if row is None:
+                continue
+            label, bar = row
             if key == "gpu" and not gpu.get("available"):
                 label.configure(text="N/A")
             else:
                 label.configure(text=f"{value:.0f}%")
             bar.set(value)
 
-        down_num, down_unit = fmt_bytes(data["net"]["down"], per_second=True)
-        up_num, up_unit = fmt_bytes(data["net"]["up"], per_second=True)
-        self.net_down.configure(text=f"↓ {down_num} {down_unit}")
-        self.net_up.configure(text=f"↑ {up_num} {up_unit}")
-        self.spark.push(data["cpu"]["total"])
-        self.clock.configure(text=datetime.now().strftime("%H:%M:%S"))
+        if self.net_down is not None:
+            down_num, down_unit = fmt_bytes(data["net"]["down"], per_second=True)
+            up_num, up_unit = fmt_bytes(data["net"]["up"], per_second=True)
+            self.net_down.configure(text=f"↓ {down_num} {down_unit}")
+            self.net_up.configure(text=f"↑ {up_num} {up_unit}")
+        if self.spark is not None:
+            self.spark.push(data["cpu"]["total"])
+        if self.clock is not None:
+            self.clock.configure(text=datetime.now().strftime("%H:%M:%S"))
+
+
+# --------------------------------------------------------------------------
+# 设置窗口
+# --------------------------------------------------------------------------
+class SettingsWindow(tk.Toplevel):
+    """悬浮窗显示设置：即时预览、自动保存。"""
+
+    def __init__(self, app: "MonitorApp"):
+        super().__init__(app)
+        self.app = app
+        self.title("设置")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(app)
+        try:
+            self.iconbitmap(ICON_PATH)
+        except tk.TclError:
+            pass
+
+        width, height = 380, 590
+        if app.state() == "withdrawn":
+            x = (self.winfo_screenwidth() - width) // 2
+            y = (self.winfo_screenheight() - height) // 2 - 40
+        else:
+            x = app.winfo_x() + (app.winfo_width() - width) // 2
+            y = app.winfo_y() + (app.winfo_height() - height) // 2
+        self.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+
+        store_float_options(app.settings, app.float_options)
+        self._metric_vars = {}
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        apply_dark_titlebar(self)
+        self.after(120, lambda: apply_dark_titlebar(self))
+
+    def _build(self):
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=18, pady=16)
+
+        tk.Label(outer, text="设置", bg=BG, fg=TEXT,
+                 font=(FONT, 14, "bold")).pack(anchor="w")
+        tk.Label(outer, text="修改后立即生效，并自动保存", bg=BG, fg=DIM,
+                 font=(FONT, 8)).pack(anchor="w", pady=(2, 12))
+
+        tk.Label(outer, text="悬浮窗显示项", bg=BG, fg=MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(0, 6))
+        metric_box = tk.Frame(outer, bg=PANEL, highlightthickness=1,
+                              highlightbackground=BORDER)
+        metric_box.pack(fill="x")
+        for key, label in FLOAT_METRICS:
+            var = tk.BooleanVar(value=bool(self.app.settings["float_metrics"].get(key, True)))
+            self._metric_vars[key] = var
+            tk.Checkbutton(metric_box, text=label, variable=var,
+                           command=lambda k=key: self._on_metric(k),
+                           bg=PANEL, fg=TEXT, activebackground=PANEL,
+                           activeforeground=TEXT, selectcolor=PANEL_ALT,
+                           font=(FONT, 9), anchor="w", bd=0,
+                           highlightthickness=0, cursor="hand2",
+                           padx=8, pady=3).pack(fill="x")
+
+        tk.Label(outer, text="悬浮窗不透明度", bg=BG, fg=MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(14, 6))
+        opacity_box = tk.Frame(outer, bg=PANEL, highlightthickness=1,
+                               highlightbackground=BORDER)
+        opacity_box.pack(fill="x")
+        head = tk.Frame(opacity_box, bg=PANEL)
+        head.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(head, text="10% – 100%", bg=PANEL, fg=DIM,
+                 font=(FONT, 8)).pack(side="left")
+        self._opacity_label = tk.Label(head,
+                                       text=f"{self.app.settings['float_opacity']}%",
+                                       bg=PANEL, fg=C_CPU,
+                                       font=(NUM, 9, "bold"))
+        self._opacity_label.pack(side="right")
+        self._slider = Slider(opacity_box, 10, 100,
+                              self.app.settings["float_opacity"],
+                              self._on_opacity, self._save)
+        self._slider.pack(fill="x", padx=10, pady=(4, 10))
+
+        tk.Label(outer, text="其他显示参数", bg=BG, fg=MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(14, 6))
+        other_box = tk.Frame(outer, bg=PANEL, highlightthickness=1,
+                             highlightbackground=BORDER)
+        other_box.pack(fill="x")
+        self._clock_var = tk.BooleanVar(value=bool(self.app.settings["float_clock"]))
+        self._top_var = tk.BooleanVar(value=bool(self.app.settings["float_topmost"]))
+        for var, text in ((self._clock_var, "显示时钟"),
+                          (self._top_var, "始终置顶")):
+            tk.Checkbutton(other_box, text=text, variable=var,
+                           command=self._on_other,
+                           bg=PANEL, fg=TEXT, activebackground=PANEL,
+                           activeforeground=TEXT, selectcolor=PANEL_ALT,
+                           font=(FONT, 9), anchor="w", bd=0,
+                           highlightthickness=0, cursor="hand2",
+                           padx=8, pady=3).pack(fill="x")
+
+        tk.Label(outer, text="托盘左键单击", bg=BG, fg=MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(14, 6))
+        click_box = tk.Frame(outer, bg=PANEL, highlightthickness=1,
+                             highlightbackground=BORDER)
+        click_box.pack(fill="x")
+        self._click_var = tk.StringVar(value=self.app.tray_click)
+        for value, text in (("open", "打开主界面"),
+                            ("toggle_float", "切换悬浮窗显示")):
+            tk.Radiobutton(click_box, text=text, value=value,
+                           variable=self._click_var,
+                           command=self._on_click_mode,
+                           bg=PANEL, fg=TEXT, activebackground=PANEL,
+                           activeforeground=TEXT, selectcolor=PANEL_ALT,
+                           font=(FONT, 9), anchor="w", bd=0,
+                           highlightthickness=0, cursor="hand2",
+                           padx=8, pady=3).pack(fill="x")
+
+        footer = tk.Frame(outer, bg=BG)
+        footer.pack(side="bottom", fill="x", pady=(16, 0))
+        tk.Button(footer, text="恢复默认", command=self._reset,
+                  bg=PANEL, fg=MUTED, activebackground=PANEL_ALT,
+                  activeforeground=TEXT, relief="flat", bd=0,
+                  font=(FONT, 8), padx=12, pady=6,
+                  cursor="hand2").pack(side="left")
+        tk.Button(footer, text="完成", command=self.close,
+                  bg=PANEL, fg=C_CPU, activebackground=PANEL_ALT,
+                  activeforeground=C_CPU, relief="flat", bd=0,
+                  font=(FONT, 8), padx=16, pady=6,
+                  cursor="hand2").pack(side="right")
+
+    def _on_metric(self, key):
+        self.app.settings["float_metrics"][key] = bool(self._metric_vars[key].get())
+        self.app.apply_float_options()
+
+    def _on_opacity(self, raw):
+        value = max(10, min(100, int(float(raw))))
+        self._opacity_label.configure(text=f"{value}%")
+        self.app.settings["float_opacity"] = value
+        self.app.float.set_opacity(value)
+
+    def _on_other(self):
+        self.app.settings["float_clock"] = bool(self._clock_var.get())
+        self.app.settings["float_topmost"] = bool(self._top_var.get())
+        self.app.apply_float_options()
+
+    def _on_click_mode(self):
+        self.app.set_tray_click(self._click_var.get())
+
+    def _reset(self):
+        for key, _ in FLOAT_METRICS:
+            self._metric_vars[key].set(True)
+            self.app.settings["float_metrics"][key] = True
+        self._clock_var.set(True)
+        self._top_var.set(True)
+        self.app.settings["float_clock"] = True
+        self.app.settings["float_topmost"] = True
+        self.app.settings["float_opacity"] = 100
+        self._slider.set(100)
+        self._on_opacity(100)
+        self._click_var.set("open")
+        self.app.set_tray_click("open")
+        self.app.apply_float_options()
+
+    def _save(self, _event=None):
+        self.app.save_settings()
+
+    def close(self):
+        self.app.save_settings()
+        self.app.settings_window = None
+        self.destroy()
 
 
 # --------------------------------------------------------------------------
@@ -798,6 +1181,9 @@ class MonitorApp(tk.Tk):
     def __init__(self, settings: dict, startup: bool = False):
         super().__init__()
         self.settings = settings
+        self.float_options = load_float_options(settings)
+        self.tray_click = normalize_tray_click(settings.get("tray_click"))
+        self.settings_window = None
         self.autostart = is_autostart_enabled()
         self._actions: queue.Queue = queue.Queue()
         self._quitting = False
@@ -826,13 +1212,19 @@ class MonitorApp(tk.Tk):
         self.tray = TrayIcon(ICON_PATH, "系统监控", self._tray_action)
         self.tray.start()
         self._sync_tray()
+        if "tray_click" not in self.settings:
+            # 旧版本升级：仅提示一次左键行为变更
+            self.settings["tray_click"] = self.tray_click
+            self.save_settings()
+            self.tray.notify("操作提示",
+                             "托盘左键单击现在会打开主界面，可在设置中改回切换悬浮窗")
         self._activation = ActivationListener(lambda: self._actions.put("open"))
         self._activation.start()
 
         self._thread = threading.Thread(target=self._sampler_loop, daemon=True)
         self._thread.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self._pump)
+        self.after(20, self._pump)
 
         if startup:
             self.withdraw()
@@ -866,6 +1258,12 @@ class MonitorApp(tk.Tk):
                                    activeforeground=TEXT, relief="flat", bd=0,
                                    font=(FONT, 8), padx=12, pady=5, cursor="hand2")
         self.float_btn.pack(side="right", padx=(0, 6))
+
+        self.settings_btn = tk.Button(header, text="设置", command=self.open_settings,
+                                      bg=PANEL, fg=MUTED, activebackground=PANEL_ALT,
+                                      activeforeground=TEXT, relief="flat", bd=0,
+                                      font=(FONT, 8), padx=12, pady=5, cursor="hand2")
+        self.settings_btn.pack(side="right", padx=(0, 6))
 
         clock_box = tk.Frame(header, bg=BG)
         clock_box.pack(side="right", padx=(0, 14))
@@ -903,15 +1301,7 @@ class MonitorApp(tk.Tk):
         self.info_card.grid(row=2, column=2, sticky="nsew", padx=6, pady=6)
 
     def _apply_dark_titlebar(self):
-        """让 Windows 标题栏跟随深色主题（Win10 2004+ / Win11）。"""
-        try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            enabled = ctypes.c_int(1)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
-        except Exception:
-            pass
+        apply_dark_titlebar(self)
 
     # -- 采样线程 --------------------------------------------------------
 
@@ -961,6 +1351,8 @@ class MonitorApp(tk.Tk):
                 self.toggle_float()
             elif action == "toggle_autostart":
                 self.toggle_autostart()
+            elif action == "settings":
+                self.open_settings()
             elif action == "quit":
                 self.quit_app()
 
@@ -1001,12 +1393,39 @@ class MonitorApp(tk.Tk):
 
     def _sync_tray(self):
         self.tray.set_state(self.float.visible, self.autostart)
+        self.tray.set_click_action(self.tray_click)
+
+    def set_tray_click(self, value: str):
+        """切换托盘左键单击行为并立即生效。"""
+        self.tray_click = normalize_tray_click(value)
+        self.settings["tray_click"] = self.tray_click
+        self._sync_tray()
+        self.save_settings()
 
     def show_main(self):
         self.deiconify()
         self.lift()
         self.focus_force()
         self.show_float_button_state()
+
+    def apply_float_options(self):
+        """设置变更后立即应用到悬浮窗，并写入配置文件。"""
+        self.float_options = load_float_options(self.settings)
+        self.float.apply_options(self.float_options)
+        self.save_settings()
+
+    def open_settings(self):
+        if self.state() == "withdrawn":
+            self.show_main()
+        if self.settings_window is not None:
+            try:
+                self.settings_window.deiconify()
+                self.settings_window.lift()
+                self.settings_window.focus_force()
+                return
+            except tk.TclError:
+                self.settings_window = None
+        self.settings_window = SettingsWindow(self)
 
     def show_float_button_state(self):
         self.float_btn.configure(fg=C_CPU if self.float.visible else MUTED,
